@@ -1,0 +1,114 @@
+name: CFnew Auto Update
+
+# 每日检查 CFnew 上游版本，有新 Release 就自动重新部署到 Cloudflare Pages
+# 不需要本机开机 —— 全程在 GitHub Actions 云端执行
+
+on:
+  schedule:
+    # 每天 04:17 UTC（北京时间 12:17），错开整点避开 GitHub 拥堵高峰
+    - cron: "17 4 * * *"
+  workflow_dispatch:          # 允许手动触发
+    inputs:
+      force:
+        description: "强制重新部署（忽略版本检查）"
+        required: false
+        default: "false"
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: cfnew-autoupdate
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Check & Deploy CFnew
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 查询 CFnew 最新版本
+        id: latest
+        run: |
+          LATEST=$(curl -sS https://api.github.com/repos/byJoey/cfnew/releases/latest \
+                   | jq -r '.tag_name')
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          CURRENT=$(cat deployed-version.txt 2>/dev/null || echo "none")
+          echo "tag=$LATEST"      >> "$GITHUB_STEP_SUMMARY"
+          echo "current=$CURRENT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 判断是否需要更新
+        id: check
+        run: |
+          LATEST="${{ steps.latest.outputs.tag }}"
+          CURRENT=$(cat deployed-version.txt 2>/dev/null || echo "none")
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "true" ] || [ "$LATEST" != "$CURRENT" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "### 需要更新: $CURRENT → $LATEST" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "### 已是最新 ($CURRENT)，跳过" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 下载新版 Pages.zip
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          TAG="${{ steps.latest.outputs.tag }}"
+          mkdir -p dist
+          curl -sSL -o cfnew.zip \
+            "https://github.com/byJoey/cfnew/releases/download/${TAG}/Pages.zip"
+          cd dist
+          unzip -o ../cfnew.zip
+          ls -la
+          test -f _worker.js || { echo "::error::包内缺少 _worker.js"; exit 1; }
+
+      - name: 配置 Cloudflare
+        if: steps.check.outputs.needed == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: 部署到 Cloudflare Pages
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          npx wrangler pages deploy dist \
+            --project-name=cfnew \
+            --branch=main \
+            --commit-dirty=true
+
+      - name: 记录已部署版本
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          echo "${{ steps.latest.outputs.tag }}" > deployed-version.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deployed-version.txt
+          git commit -m "chore: auto-update to ${{ steps.latest.outputs.tag }}" || true
+          git push || echo "::warning::版本记录提交失败（不影响已部署的站点）"
+
+      - name: 部署后冒烟测试
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          URL="https://cfnew-do9.pages.dev"
+          echo "### 部署后验证" >> "$GITHUB_STEP_SUMMARY"
+          sleep 15
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+          echo "- 主地址 HTTP $CODE" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::部署后主地址返回 $CODE，请检查"
+            exit 1
+          fi
+          SUB_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            "$URL/${{ vars.CFNEW_UUID }}/sub?target=vg" || echo "000")
+          echo "- 家宽订阅 HTTP $SUB_CODE" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SUB_CODE" != "200" ]; then
+            echo "::error::家宽订阅返回 $SUB_CODE（403=jk 未生效，1101=未绑自定义域）"
+            exit 1
+          fi
